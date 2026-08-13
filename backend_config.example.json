@@ -1,0 +1,5 @@
+{
+  "base_url": "https://api.ppio.com/openai",
+  "api_key": "请填写 API Key",
+  "model": "qwen/qwen3.8-max"
+}
