@@ -7,13 +7,13 @@ import logging
 import os
 import re
 import time
-from typing import Any, List, Literal, Optional, Tuple, Type, TypeVar
+from pathlib import Path
+from typing import List, Literal, Optional, Tuple, Type, TypeVar
 
 import fitz
 import streamlit as st
 from openai import OpenAI
-from anthropic import Anthropic
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, ValidationError
 
 
@@ -27,10 +27,8 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
 
-DEFAULT_API_KEY = ""
-DEFAULT_BASE_URL = "https://api.ppio.com/openai"
 DEFAULT_MODEL = "qwen/qwen3.8-max"
-BACKEND_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend_config.json")
+CONFIG_PATH = Path(__file__).resolve().with_name("backend_config.json")
 
 
 class Box(BaseModel):
@@ -77,8 +75,8 @@ SYSTEM_PROMPT = """你是一名专业机械工程图智能解析助手，擅长�
 对于图片中每一个实际可见的编号标识：
 
 1. 找到编号标识本身；
-2. 所有标识的小三角尖角方向固定为右下方；
-3. 以圆圈中心为原点，只在图像第四象限（x增大、y增大，即右下区域）寻找对应的尺寸文字、技术要求或公差框；
+2. 判断编号圆圈、箭头、三角尖角或引线的实际指向方向；
+3. 沿指向方向寻找它对应的尺寸文字、技术要求或公差框；
 4. 必须识别完整内容；
 5. 判断该标注属于什么机械制图类型；
 6. 用符合真实机械加工/检验场景的语言解释它的工程含义。
@@ -118,11 +116,11 @@ SYSTEM_PROMPT = """你是一名专业机械工程图智能解析助手，擅长�
 四、编号与尺寸对应规则
 ====================
 
-编号圆圈 → 读取圈内数字仅用于确定编号 → 找到圆圈中心和右下侧三角尖角 → 从圆圈外缘的三角尖端开始向右下延伸 → 只在圆圈中心的第四象限（x增大且y增大）寻找有效标注 → 判断引线或尺寸线关系 → 确认完整尺寸 → 再进行工程语义解释。
+编号圆圈 → 找到圆圈上的三角尖角/箭头 → 判断尖角朝向 → 沿朝向寻找最近的有效标注 → 判断引线或尺寸线关系 → 确认完整尺寸 → 再进行工程语义解释。
 
 禁止仅根据"距离哪个数字最近"进行匹配。
 
-本批图所有三角尖角都固定朝右下。禁止输出左下、左上、右上、左、右、上或下等其他方向；即使视觉上看似朝左下，也必须按右下方向重新判断。这里的“右下”不是“右侧或下侧”，而是目标位置必须同时满足 x目标>x圆心 且 y目标>y圆心。
+如果三角尖角朝右，则优先分析右侧目标；朝左则优先分析左侧目标；朝上/下则按照真实方向分析。
 
 同时结合尺寸线、尺寸界线、引出线、箭头、中心线、剖面线、零件轮廓判断真正对应的尺寸。
 
@@ -131,7 +129,7 @@ SYSTEM_PROMPT = """你是一名专业机械工程图智能解析助手，擅长�
 ====================
 
 以下内容不得作为编号对应尺寸：
-圆圈内部的全部像素和文字（尤其圈内编号）、标题栏日期、图号、页码、比例、公司名称、材料栏、与尖角方向相反的无关数字、附近但属于其他尺寸线的数字、无法证明与编号存在指向关系的文字。圈内编号只能作为 marker_number，永远不能作为 full_annotation，也不能参与目标值判断。
+圆圈内部的编号、标题栏日期、图号、页码、比例、公司名称、材料栏、与尖角方向相反的无关数字、附近但属于其他尺寸线的数字、无法证明与编号存在指向关系的文字。
 
 ====================
 六、真实工程场景约束
@@ -163,13 +161,13 @@ SYSTEM_PROMPT = """你是一名专业机械工程图智能解析助手，擅长�
 最重要的判定原则是：三角尖角方向 > 引线方向 > 空间距离。目标不是寻找编号附近的文字，而是理解编号引线的实际指向关系。"""
 
 
-LOCATE_PROMPT = """你是机械 CAD 工程图视觉定位器。输入图片是完整图纸页面。编号标识的样式已在下文中描述。
-先只做定位，不识别编号对应的尺寸。找出页面中所有与参考样式一致的橙红色/红色圆圈编号（通常为1~17），并逐个定位圆圈边缘的小三角形尖角。
+LOCATE_PROMPT = """你是机械 CAD 工程图视觉定位器。输入图是完整图纸页面。
+先只做定位，不识别编号对应的尺寸。编号标识的样式是橙红色或红色圆圈，圈内通常为 1~17 的数字，圆圈边缘带有一个小三角形尖角。找出页面中所有符合此描述的编号标识，并逐个定位小三角形尖角。
 
 要求：
 1. bbox 必须紧贴完整标识（包含圆圈与三角形），坐标为相对完整页面宽高的 0~1 数值。
 2. triangle_tip 是三角形最尖端在完整页面中的归一化坐标；看不清则为 null。
-3. arrow_direction 必须固定输出"右下"。坐标定义：图片左上角为原点，x向右增大，y向下增大；右下即圆圈中心的第四象限（x增大、y增大）。禁止输出"左下"或其他方向。
+3. 必须根据每个标识实际可见的三角尖角独立判断 arrow_direction，例如左、右、上、下、左上、右上、左下或右下；不得把方向固定为某一方向。
 4. 不要把普通尺寸圆、剖视圆或粗糙度符号误认成该标识。
 5. 若没有可靠结果，markers 返回空数组。不要臆造。
 6. 仔细区分圈内编号，确保不混淆相近数字（如6和9、1和7）；不要把圈内数字当作尺寸。
@@ -177,28 +175,19 @@ LOCATE_PROMPT = """你是机械 CAD 工程图视觉定位器。输入图片是�
 """
 
 
-TARGET_PROMPT = """你是机械工程图尺寸标识关联分析专家。输入图片是围绕编号 {number} 裁剪出的高清局部图。编号标识样式已在提示词中描述。本次只能分析编号 {number}，不要同时推理其他编号。
+TARGET_PROMPT = """你是机械工程图尺寸标识关联分析专家。输入图是围绕编号 {number} 裁剪出的高清局部图。编号标识是橙红色或红色圆圈，圈内是数字，圆圈边缘带小三角形尖角。本次只能分析编号 {number}，不要同时推理其他编号。
 
 请严格按照以下流程识别该编号标识指向的工程尺寸或技术要求：
 
 1. 找到编号 {number} 的圆圈标识
-2. 找到圆圈中心以及圆圈右下侧的小三角尖角；方向固定为右下，禁止判断为左下或其他方向
-3. 以圆圈中心为原点，只允许从圆圈外缘的右下三角尖端出发，沿 x增大且y增大的方向向右下延伸；只在第四象限寻找对应的尺寸、形位公差或技术要求
+2. 找到圆圈边缘的小三角形尖角，判断尖角实际朝向及引线方向
+3. 从三角尖端沿实际指向方向追踪引线和最终落点，寻找对应的尺寸、形位公差或技术要求
 4. 完整识别标注内容（保留φ、R、M、±、°、×、Ra等所有工程符号）
 5. 判断标注的机械制图类型
 6. 用机械加工/检验场景语言解释工程含义
 
 关键规则：
 - 判定优先级严格为：三角尖角方向 > 引线方向 > 空间距离
-- 三角尖角方向固定为右下；这不是“优先”条件，而是硬性过滤条件。候选目标必须同时满足 x目标>x圆心 且 y目标>y圆心；只满足其中一个条件的目标一律排除
-- 延伸起点必须是圆圈外缘的右下三角尖端，不得从圆圈内部、编号数字、圆心或圆圈左侧开始搜索
-- 圆圈内部仅用于读取 marker_number={number}。必须忽略圈内所有内容，严禁把圈内数字 {number} 或其任何笔画识别为尺寸值或标注内容
-- 搜索射线只能由标识向右下延伸，绝不能从右下候选反向穿过圆圈后继续到左上、左下或右上寻找文字
-- 即使其他象限的文字更近、更清晰或存在引线，也不得选取；第四象限没有可靠目标时必须输出“无法确认”
-- 在右下方向存在多个候选时，先计算候选到“三角尖端向右下延伸射线”的垂直距离，只保留射线命中或最贴近射线的候选；再选择沿射线前进距离最近、最先命中的值
-- “射线上最近”高于普通二维距离。不得越过射线先命中的 1.5×45°，去选择更远或偏离射线的 M48 等文字
-- 若提示中列出了相邻重叠标识已经占用的值，本编号不得重复选择这些值，应从自己射线上的剩余候选中选择
-- confidence_reason 中必须将方向描述为"右下"，不得写"左下"、"左上"或"右上"
 - 禁止选择距离编号最近、视觉上最大或位于尖角反方向的文字
 - 目标可离编号较远；必须沿尖角和引线追踪到实际落点
 - 绿色文字和绿色框可能是形位公差、表面粗糙度或技术要求，不得忽略
@@ -223,12 +212,12 @@ confidence_level 判定：
 
 FULL_PAGE_PROMPT = """分析这张机械工程图/CAD图纸中所有橙红色圆圈编号（通常为1~17）实际指向的尺寸、形位公差或技术要求。
 
-输入图片是待分析的工程图纸页面。编号标识样式已在提示词中描述。
+输入图是待分析的工程图纸页面。编号标识是橙红色或红色圆圈，圈内通常为 1~17 的数字，圆圈边缘带小三角形尖角。
 
 必须先定位所有编号，再严格按编号顺序逐个分析；完成一个编号后才分析下一个，不要同时推理所有编号。每个编号均执行：
 1. 确认橙红色/红色圆圈及圈内编号，圈内数字不是尺寸
-2. 找到圆圈右下侧三角尖角，方向固定为右下
-3. 从圆圈中心第四象限（x增大、y增大）沿尖角方向和引线追踪最终落点
+2. 找到圆圈边缘三角尖角并独立判断实际朝向
+3. 沿尖角方向和引线追踪最终落点
 4. 完整识别落点处标注，保留φ、R、M、±、°、×、小数、上下偏差和基准字母
 5. 判断类型；无法确认时明确输出"无法确认"，不得猜测
 
@@ -248,49 +237,25 @@ FULL_PAGE_PROMPT = """分析这张机械工程图/CAD图纸中所有橙红色圆
 类型使用：直径尺寸、长度尺寸、半径、螺纹、倒角、角度、形位公差、其他。无法确定时输出：{"编号":"X","指向值":"无法确认","类型":"其他","置信度":0}。"""
 
 
-def load_backend_config() -> dict:
-    """读取项目目录中的后端私有配置文件。"""
-    if not os.path.exists(BACKEND_CONFIG_PATH):
-        return {}
+def load_backend_config() -> Tuple[str, str, str]:
+    """仅从项目目录的 JSON 文件读取服务端连接配置。"""
     try:
-        with open(BACKEND_CONFIG_PATH, "r", encoding="utf-8") as config_file:
-            data = json.load(config_file)
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError, AttributeError):
-        logger.exception("failed to load backend config path=%s", BACKEND_CONFIG_PATH)
-        return {}
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError("缺少 backend_config.json，请根据 backend_config.example.json 创建配置文件。") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"backend_config.json 读取失败或不是合法 JSON：{exc}") from exc
 
-
-def openai_runtime_settings(config: dict) -> Tuple[str, str, str]:
-    try:
-        cloud_config = dict(st.secrets.get("backend", {}))
-    except (FileNotFoundError, KeyError):
-        cloud_config = {}
-    base_url = (
-        os.getenv("OPENAI_BASE_URL")
-        or cloud_config.get("base_url")
-        or config.get("base_url")
-        or DEFAULT_BASE_URL
-    )
-    base_url = str(base_url).rstrip("/")
-
-    api_key = (
-        os.getenv("OPENAI_API_KEY")
-        or cloud_config.get("api_key")
-        or config.get("api_key")
-        or DEFAULT_API_KEY
-    )
-    model = (
-        os.getenv("OPENAI_MODEL")
-        or cloud_config.get("model")
-        or config.get("model")
-        or DEFAULT_MODEL
-    )
-    return base_url, str(api_key), str(model)
-
-
-def backend_protocol(base_url: str) -> str:
-    return "anthropic" if base_url.rstrip("/").lower().endswith("/anthropic") else "openai"
+    if not isinstance(data, dict):
+        raise RuntimeError("backend_config.json 的根节点必须是 JSON 对象。")
+    base_url = str(data.get("base_url", "")).strip().rstrip("/")
+    if base_url.endswith("/anthropic"):
+        base_url = base_url[: -len("/anthropic")] + "/openai"
+    api_key = str(data.get("api_key", "")).strip()
+    model = str(data.get("model", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+    if not base_url or not api_key:
+        raise RuntimeError("backend_config.json 必须填写非空的 base_url 和 api_key。")
+    return base_url, api_key, model
 
 
 def image_base64(image: Image.Image, image_format: str = "PNG") -> str:
@@ -320,26 +285,14 @@ def image_block(image: Image.Image) -> dict:
     }
 
 
-def enhance_cad_lines(image: Image.Image, strength: float = 2.4) -> Image.Image:
-    """Darken pale CAD strokes while keeping the white paper background white."""
-    if strength <= 1.0:
-        return image.convert("RGB")
-    rgb = image.convert("RGB")
-    lut = [max(0, min(255, round(255 - (255 - value) * strength))) for value in range(256)]
-    enhanced = rgb.point(lut * 3)
-    enhanced = ImageEnhance.Color(enhanced).enhance(1.15)
-    return ImageEnhance.Sharpness(enhanced).enhance(1.2)
-
-
-def render_pdf(pdf_bytes: bytes, dpi: int, color_strength: float = 2.4) -> List[Image.Image]:
+def render_pdf(pdf_bytes: bytes, dpi: int) -> List[Image.Image]:
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     matrix = fitz.Matrix(dpi / 72, dpi / 72)
     pages = []
     try:
         for page in document:
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            rendered = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
-            pages.append(enhance_cad_lines(rendered, color_strength))
+            pages.append(Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB"))
     finally:
         document.close()
     return pages
@@ -353,34 +306,7 @@ def extract_text(completion: object) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-def _anthropic_messages(messages: list[dict]) -> tuple[Optional[str], list[dict]]:
-    system_parts: list[str] = []
-    converted: list[dict] = []
-    for message in messages:
-        role = message.get("role", "user")
-        if role == "system":
-            content = message.get("content", "")
-            system_parts.append(content if isinstance(content, str) else str(content))
-            continue
-        content = message.get("content", "")
-        if isinstance(content, list):
-            blocks = []
-            for item in content:
-                if item.get("type") == "text":
-                    blocks.append({"type": "text", "text": item.get("text", "")})
-                elif item.get("type") == "image_url":
-                    data_url = item.get("image_url", {}).get("url", "")
-                    match = re.match(r"data:([^;]+);base64,(.+)", data_url, re.DOTALL)
-                    if match:
-                        blocks.append({"type": "image", "source": {
-                            "type": "base64", "media_type": match.group(1), "data": match.group(2)
-                        }})
-            content = blocks
-        converted.append({"role": role, "content": content})
-    return ("\n\n".join(system_parts) or None), converted
-
-
-def stream_completion(client: Any, kwargs: dict, label: str) -> str:
+def stream_completion(client: OpenAI, kwargs: dict, label: str) -> str:
     """流式接收模型文本；原始返回写日志，页面只显示耗时与 token usage。"""
     parts: List[str] = []
     reasoning_parts: List[str] = []
@@ -397,49 +323,30 @@ def stream_completion(client: Any, kwargs: dict, label: str) -> str:
         kwargs.get("model"),
         sum(1 for message in kwargs.get("messages", []) for item in (message.get("content", []) if isinstance(message.get("content"), list) else []) if item.get("type") == "image_url"),
     )
-    if isinstance(client, Anthropic):
-        system, messages = _anthropic_messages(kwargs.get("messages", []))
-        anthropic_kwargs = {
-            "model": kwargs["model"], "max_tokens": kwargs.get("max_tokens", 8192),
-            "temperature": kwargs.get("temperature", 0), "messages": messages,
-        }
-        if system:
-            anthropic_kwargs["system"] = system
-        with client.messages.stream(**anthropic_kwargs) as stream:
-            for text in stream.text_stream:
-                parts.append(text)
-            final_message = stream.get_final_message()
-            usage = getattr(final_message, "usage", None)
-            finish_reason = getattr(final_message, "stop_reason", None)
-            if finish_reason:
+    with client.chat.completions.create(**stream_kwargs) as stream:
+        for chunk in stream:
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+            choices = getattr(chunk, "choices", [])
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            finish_reason = getattr(choices[0], "finish_reason", None)
+            if finish_reason and finish_reason not in finish_reasons:
                 finish_reasons.append(finish_reason)
-    else:
-        with client.chat.completions.create(**stream_kwargs) as stream:
-            for chunk in stream:
-                chunk_usage = getattr(chunk, "usage", None)
-                if chunk_usage is not None:
-                    usage = chunk_usage
-                choices = getattr(chunk, "choices", [])
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                finish_reason = getattr(choices[0], "finish_reason", None)
-                if finish_reason and finish_reason not in finish_reasons:
-                    finish_reasons.append(finish_reason)
-                text = getattr(delta, "content", None) if delta is not None else None
-                reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
-                if isinstance(reasoning, str) and reasoning:
-                    reasoning_parts.append(reasoning)
-                if isinstance(text, str) and text:
-                    parts.append(text)
+            text = getattr(delta, "content", None) if delta is not None else None
+            reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+            if isinstance(text, str) and text:
+                parts.append(text)
 
     elapsed = time.monotonic() - started
     raw_text = "".join(parts).strip()
-    prompt_tokens = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", None))
-    completion_tokens = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", None))
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
     total_tokens = getattr(usage, "total_tokens", None)
-    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
-        total_tokens = prompt_tokens + completion_tokens
     logger.info(
         "request completed label=%s model=%s elapsed=%.1fs prompt_tokens=%s completion_tokens=%s total_tokens=%s finish_reason=%s content_chars=%d reasoning_chars=%d",
         label, kwargs.get("model"), elapsed, prompt_tokens, completion_tokens, total_tokens,
@@ -531,16 +438,8 @@ def repair_json(text: str) -> str:
         return text
 
 
-def create_client(api_key: str, base_url: str) -> Any:
-    protocol = backend_protocol(base_url)
-    logger.info("create client protocol=%s base_url=%s", protocol, base_url.rstrip("/"))
-    if protocol == "anthropic":
-        return Anthropic(
-            api_key=api_key,
-            base_url=base_url.rstrip("/"),
-            timeout=180.0,
-            max_retries=2,
-        )
+def create_client(api_key: str, base_url: str) -> OpenAI:
+    logger.info("create client base_url=%s", base_url.rstrip("/"))
     return OpenAI(
         api_key=api_key,
         base_url=base_url.rstrip("/"),
@@ -659,18 +558,15 @@ def crop_around_marker(
     x1, y1, x2, y2 = normalized_box_to_pixels(marker.bbox, page.size)
     marker_w = max(x2 - x1, 20)
     marker_h = max(y2 - y1, 20)
-    # Keep the marker visible near the crop's upper-left and spend most of the
-    # crop area on its required fourth quadrant (right/down). This prevents
-    # unrelated values in the other three quadrants from dominating OCR.
-    context_w = marker_w * 1.0
-    context_h = marker_h * 1.0
-    reach_w = marker_w * max(multiplier - 1.0, 1.0)
-    reach_h = marker_h * max(multiplier - 1.0, 1.0)
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+    half_w = marker_w * multiplier / 2
+    half_h = marker_h * multiplier / 2
     crop_box = (
-        max(0, int(x1 - context_w)),
-        max(0, int(y1 - context_h)),
-        min(width, int(x2 + reach_w)),
-        min(height, int(y2 + reach_h)),
+        max(0, int(cx - half_w)),
+        max(0, int(cy - half_h)),
+        min(width, int(cx + half_w)),
+        min(height, int(cy + half_h)),
     )
     return page.crop(crop_box), crop_box
 
@@ -679,27 +575,40 @@ def identify_target(
     client: OpenAI,
     model: str,
     crop: Image.Image,
-    number: str,
-    occupied_annotations: Optional[List[str]] = None,
+    marker: Marker,
+    crop_box: Tuple[int, int, int, int],
+    page_size: Tuple[int, int],
 ) -> DimensionItem:
-    prompt = TARGET_PROMPT.format(number=number)
-    if occupied_annotations:
-        prompt += (
-            "\n\n相邻或重叠标识已确认并占用以下值："
-            + "、".join(occupied_annotations)
-            + "。除非图中明确存在另一处完全相同的独立标注，否则本编号不得重复选择这些值；"
-              "请在本编号右下射线上选择最近的剩余候选。"
-        )
+    page_width, page_height = page_size
+    crop_x1, crop_y1, crop_x2, crop_y2 = crop_box
+    crop_width = max(crop_x2 - crop_x1, 1)
+    crop_height = max(crop_y2 - crop_y1, 1)
+    marker_x1, marker_y1, marker_x2, marker_y2 = normalized_box_to_pixels(marker.bbox, page_size)
+    local_bbox = {
+        "x1": round((marker_x1 - crop_x1) / crop_width, 4),
+        "y1": round((marker_y1 - crop_y1) / crop_height, 4),
+        "x2": round((marker_x2 - crop_x1) / crop_width, 4),
+        "y2": round((marker_y2 - crop_y1) / crop_height, 4),
+    }
+    local_tip = None
+    if marker.triangle_tip is not None:
+        tip_x = marker.triangle_tip.x * page_width
+        tip_y = marker.triangle_tip.y * page_height
+        local_tip = {
+            "x": round((tip_x - crop_x1) / crop_width, 4),
+            "y": round((tip_y - crop_y1) / crop_height, 4),
+        }
+    prompt = TARGET_PROMPT.format(number=marker.number) + (
+        "\n\n定位阶段提供的当前裁剪图归一化坐标如下："
+        f"编号框 bbox={json.dumps(local_bbox, ensure_ascii=False)}，"
+        f"三角尖端={json.dumps(local_tip, ensure_ascii=False)}，"
+        f"方向={marker.arrow_direction}。"
+        "必须以这些坐标锁定当前编号，不得把裁剪图中的其他编号当作当前编号。"
+        "优先检查当前编号圆圈紧邻下方或尖角延长线上的标注。"
+        "若某候选标注明显更靠近另一个编号圆圈，禁止将它归给当前编号。"
+        "特别注意：1.5×45° 等倒角文字必须按其空间位置和引线归属，不能被下方其他编号拿走。"
+    )
     return call_vision_json(client, model, SYSTEM_PROMPT, prompt, [crop], DimensionItem)
-
-
-def marker_boxes_are_near(a: Marker, b: Marker) -> bool:
-    """Whether two markers are close enough to compete for the same annotations."""
-    acx, acy = (a.bbox.x1 + a.bbox.x2) / 2, (a.bbox.y1 + a.bbox.y2) / 2
-    bcx, bcy = (b.bbox.x1 + b.bbox.x2) / 2, (b.bbox.y1 + b.bbox.y2) / 2
-    aw, ah = abs(a.bbox.x2 - a.bbox.x1), abs(a.bbox.y2 - a.bbox.y1)
-    bw, bh = abs(b.bbox.x2 - b.bbox.x1), abs(b.bbox.y2 - b.bbox.y1)
-    return abs(acx - bcx) <= max(aw, bw) * 1.8 and abs(acy - bcy) <= max(ah, bh) * 2.5
 
 
 def full_page_analysis(
@@ -741,25 +650,19 @@ def main() -> None:
     st.title("CAD 机械工程图尺寸识别")
     st.caption("基于视觉模型的两阶段识别：整页定位标识 → 自动裁剪局部 → 判断关联尺寸与工程含义")
 
-    backend_config = load_backend_config()
-    default_url, default_token, default_model = openai_runtime_settings(backend_config)
+    try:
+        base_url, api_key, default_model = load_backend_config()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
 
     with st.sidebar:
         st.subheader("模型配置")
-        st.caption("API 地址和密钥由后端配置文件提供")
         model = st.text_input("视觉模型", value=default_model)
         st.divider()
         st.subheader("识别参数")
         mode = st.radio("识别模式", ["两阶段精确识别", "整页直接分析"], index=0)
         dpi = st.slider("PDF 渲染 DPI", 200, 600, 350, 50)
-        color_strength = st.slider(
-            "PDF 线条增色强度",
-            1.0,
-            4.0,
-            2.4,
-            0.2,
-            help="浅色 CAD 图层看不清时调高；1.0 表示保持 PDF 原色。",
-        )
         crop_multiplier = st.slider("标识裁剪范围（标识尺寸倍数）", 6.0, 20.0, 12.0, 1.0)
         min_confidence = st.slider("最低标识置信度", 0.0, 1.0, 0.45, 0.05)
 
@@ -770,18 +673,16 @@ def main() -> None:
         image_file = st.file_uploader("或上传图片", type=["png", "jpg", "jpeg", "bmp", "tiff"])
 
     has_input = bool(pdf_file or image_file)
-    backend_configured = bool(default_token and default_url)
-    ready = bool(has_input and backend_configured and model)
-    if not backend_configured:
-        st.error("后端配置文件缺少 API Base URL 或 API Key，请检查项目目录中的 backend_config.json。")
+    ready = bool(has_input and model.strip())
     if not st.button("开始识别", type="primary", disabled=not ready):
         return
 
-    client = create_client(default_token, default_url)
+    client = create_client(api_key, base_url)
+    model = model.strip()
 
     if pdf_file:
         with st.spinner("正在渲染 PDF…"):
-            pages = render_pdf(pdf_file.getvalue(), dpi, color_strength)
+            pages = render_pdf(pdf_file.getvalue(), dpi)
         source_name = pdf_file.name
     else:
         pages = [Image.open(image_file).convert("RGB")]
@@ -847,28 +748,13 @@ def _run_two_stage_mode(
             st.write("去重后检测到 %d 个不同编号标识" % len(markers))
 
             page_results = []
-            resolved: list[tuple[Marker, DimensionItem]] = []
-            # Resolve lower markers first. For vertically overlapping labels such
-            # as 6/7, this lets the lower ray claim φ75 before 6 considers φ40.
-            recognition_order = sorted(
-                markers,
-                key=lambda m: ((m.bbox.y1 + m.bbox.y2) / 2, (m.bbox.x1 + m.bbox.x2) / 2),
-                reverse=True,
-            )
-            for marker_index, marker in enumerate(recognition_order, start=1):
+            for marker_index, marker in enumerate(markers, start=1):
                 st.write(
                     "第 %d 页，标识 %s（%d/%d）：裁剪并识别"
                     % (page_index, marker.number, marker_index, len(markers))
                 )
                 crop, crop_box = crop_around_marker(page, marker, crop_multiplier)
-                occupied = [
-                    item.full_annotation
-                    for other, item in resolved
-                    if marker_boxes_are_near(marker, other)
-                    and item.full_annotation not in ("", "无法确认")
-                ]
-                target = identify_target(client, model, crop, marker.number, occupied)
-                resolved.append((marker, target))
+                target = identify_target(client, model, crop, marker, crop_box, page.size)
                 page_results.append(
                     {
                         "marker": marker.model_dump(),
@@ -895,8 +781,6 @@ def _run_two_stage_mode(
                     )
                     right.markdown(info)
 
-            page_results.sort(key=lambda item: (int(item["marker"]["number"]) if item["marker"]["number"].isdigit() else 999))
-            all_items.sort(key=lambda item: (int(item.marker_number) if item.marker_number.isdigit() else 999))
             all_results.append({"page": page_index, "items": page_results})
             st.image(annotate_page(page, markers), caption="第 %d 页标识定位结果" % page_index)
 
