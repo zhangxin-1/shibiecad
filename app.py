@@ -239,23 +239,91 @@ FULL_PAGE_PROMPT = """分析这张机械工程图/CAD图纸中所有橙红色圆
 类型使用：直径尺寸、长度尺寸、半径、螺纹、倒角、角度、形位公差、其他。无法确定时输出：{"编号":"X","指向值":"无法确认","类型":"其他","置信度":0}。"""
 
 
+SINGLE_PROMPT = """你是一名专业机械工程图智能解析助手，擅长识别机械制图中的尺寸标识关联关系。
+
+你的任务：
+
+根据输入的机械工程图图片，识别图中橙红色圆圈编号标识（1~17），并找到每个编号对应的三角尖角箭头实际指向的尺寸、形位公差或技术要求。
+
+注意：你的目标不是寻找编号附近的文字，而是理解工程图中的“编号引线指向关系”。
+
+【识别流程】
+
+对于每一个橙红色编号：
+
+步骤1：定位橙红色圆圈编号。确认圆圈外观为橙红色/红色、圆圈内部为阿拉伯数字、数字范围通常为1~17。不要把圆圈中的数字作为尺寸，不要把编号附近最近的数字直接作为结果。
+
+步骤2：寻找圆圈边缘的三角形尖角。三角尖角是该编号真正的指向标识。需要判断尖角朝向、引线方向和尖角最终落点位置。判断优先级：三角尖角方向 > 引线方向 > 空间距离。禁止选择距离编号最近的尺寸、视觉上最大的数字或反方向的尺寸。
+
+步骤3：沿箭头方向寻找目标文字。目标可能包括：普通尺寸（φ40、φ75、φ94、350）、半径（R10）、螺纹（M50-6H、M60×2-6H）、倒角（1×45°、1.5×45°）、角度（45°）、形位公差（◎0.05 A、⊥0.05 A、⌖0.05 A）。
+
+必须完整保留 φ、R、M、±公差、°、×、小数和基准字母。
+
+【机械工程图特殊规则】
+
+1. 编号可能距离目标尺寸较远。例如编号3附近可能存在 M60×2-6H、φ49，但是如果三角尖角指向倒角，则目标应为 1.5×45°，不能选择附近的螺纹尺寸。
+2. 绿色文字和绿色框通常表示形位公差、表面粗糙度或技术要求，不要忽略绿色标注。
+3. 红色尺寸线只是辅助信息，编号对应关系以三角尖角为准。
+
+【输出要求】
+
+只返回JSON格式：
+[
+  {
+    "编号": "1",
+    "指向值": "◎0.05 A",
+    "类型": "形位公差",
+    "置信度": 0.95
+  }
+]
+
+类型包括：直径尺寸、长度尺寸、半径、螺纹、倒角、角度、形位公差、其他。
+
+【禁止事项】
+
+1. 禁止把编号数字当成尺寸。例如编号5不能直接输出5，应沿指向找到如R10。
+2. 禁止根据距离匹配。例如编号3附近看到M60不能直接输出M60，应沿箭头方向找到1.5×45°。
+3. 禁止虚构不存在的尺寸。
+4. 禁止修改图片中的尺寸。
+5. 禁止补全无法确认的信息。
+
+【最终检查】
+
+输出前必须逐项确认：是否找到橙红编号圆圈；是否找到三角尖角；是否沿尖角方向寻找；是否排除了附近干扰尺寸；是否完整输出尺寸符号。
+
+如果无法确定，输出：
+{
+  "编号": "X",
+  "指向值": "无法确认",
+  "置信度": 0
+}
+
+不要猜测。
+
+现在开始分析输入工程图。"""
+
+
 def load_backend_config() -> Tuple[str, str, str]:
-    """本地读取 JSON；部署环境在 JSON 不存在时读取 Streamlit Secrets。"""
-    if CONFIG_PATH.exists():
+    """Streamlit Secrets 优先；未配置 Secrets 时读取本地 JSON。"""
+    try:
+        secrets_backend = st.secrets.get("backend")
+    except (FileNotFoundError, KeyError):
+        secrets_backend = None
+
+    if secrets_backend:
+        data = dict(secrets_backend)
+        config_source = "Streamlit Secrets 的 [backend]"
+    elif CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"backend_config.json 读取失败或不是合法 JSON：{exc}") from exc
         config_source = "backend_config.json"
     else:
-        try:
-            data = dict(st.secrets["backend"])
-        except (KeyError, FileNotFoundError) as exc:
-            raise RuntimeError(
-                "未找到后端配置。本地请创建 backend_config.json；Streamlit Cloud 请在 "
-                "App settings → Secrets 中配置 [backend]。"
-            ) from exc
-        config_source = "Streamlit Secrets 的 [backend]"
+        raise RuntimeError(
+            "未找到后端配置。本地请创建 backend_config.json；Streamlit Cloud 请在 "
+            "App settings → Secrets 中配置 [backend]。"
+        )
 
     if not isinstance(data, dict):
         raise RuntimeError(f"{config_source} 必须是配置对象。")
@@ -689,7 +757,7 @@ def full_page_analysis(
     model: str,
     page: Image.Image,
 ) -> str:
-    return call_vision_text(client, model, SYSTEM_PROMPT, FULL_PAGE_PROMPT, [page])
+    return call_vision_text(client, model, "", SINGLE_PROMPT, [page])
 
 
 def annotate_page(page: Image.Image, markers: List[Marker]) -> Image.Image:
@@ -734,7 +802,6 @@ def main() -> None:
         model = st.text_input("视觉模型", value=default_model)
         st.divider()
         st.subheader("识别参数")
-        mode = st.radio("识别模式", ["两阶段精确识别", "整页直接分析"], index=0)
         dpi = st.slider("PDF 渲染 DPI", 200, 600, 350, 50)
         crop_multiplier = st.slider("标识裁剪范围（标识尺寸倍数）", 6.0, 20.0, 12.0, 1.0)
         min_confidence = st.slider("最低标识置信度", 0.0, 1.0, 0.45, 0.05)
@@ -762,10 +829,7 @@ def main() -> None:
         source_name = image_file.name
 
     try:
-        if mode == "整页直接分析":
-            _run_full_page_mode(client, model, pages, source_name)
-        else:
-            _run_two_stage_mode(client, model, pages, source_name, min_confidence, crop_multiplier)
+        _run_two_stage_mode(client, model, pages, source_name, min_confidence, crop_multiplier)
     except Exception as exc:
         st.exception(exc)
 
