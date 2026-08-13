@@ -8,16 +8,18 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, Type, TypeVar
+from typing import Any, List, Literal, Optional, Tuple, Type, TypeVar
 
 import fitz
 import streamlit as st
+from anthropic import Anthropic
 from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, ValidationError
 
 
 T = TypeVar("T", bound=BaseModel)
+ApiClient = OpenAI | Anthropic
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.log")
 logger = logging.getLogger("cad_recognition")
@@ -238,23 +240,39 @@ FULL_PAGE_PROMPT = """分析这张机械工程图/CAD图纸中所有橙红色圆
 
 
 def load_backend_config() -> Tuple[str, str, str]:
-    """仅从项目目录的 JSON 文件读取服务端连接配置。"""
-    try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise RuntimeError("缺少 backend_config.json，请根据 backend_config.example.json 创建配置文件。") from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"backend_config.json 读取失败或不是合法 JSON：{exc}") from exc
+    """本地读取 JSON；部署环境在 JSON 不存在时读取 Streamlit Secrets。"""
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"backend_config.json 读取失败或不是合法 JSON：{exc}") from exc
+        config_source = "backend_config.json"
+    else:
+        try:
+            data = dict(st.secrets["backend"])
+        except (KeyError, FileNotFoundError) as exc:
+            raise RuntimeError(
+                "未找到后端配置。本地请创建 backend_config.json；Streamlit Cloud 请在 "
+                "App settings → Secrets 中配置 [backend]。"
+            ) from exc
+        config_source = "Streamlit Secrets 的 [backend]"
 
     if not isinstance(data, dict):
-        raise RuntimeError("backend_config.json 的根节点必须是 JSON 对象。")
+        raise RuntimeError(f"{config_source} 必须是配置对象。")
     base_url = str(data.get("base_url", "")).strip().rstrip("/")
-    if base_url.endswith("/anthropic"):
-        base_url = base_url[: -len("/anthropic")] + "/openai"
     api_key = str(data.get("api_key", "")).strip()
     model = str(data.get("model", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     if not base_url or not api_key:
-        raise RuntimeError("backend_config.json 必须填写非空的 base_url 和 api_key。")
+        raise RuntimeError(f"{config_source} 必须填写非空的 base_url 和 api_key。")
+    if api_key in {"请填写 API Key", "你的 API Key"}:
+        raise RuntimeError(f"{config_source} 中的 api_key 仍是示例占位文字，请填写真实 API Key。")
+    try:
+        api_key.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise RuntimeError(
+            f"{config_source} 中的 api_key 包含中文、全角引号或其他非 ASCII 字符，"
+            "请填写真实的原始 API Key。"
+        ) from exc
     return base_url, api_key, model
 
 
@@ -306,47 +324,98 @@ def extract_text(completion: object) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-def stream_completion(client: OpenAI, kwargs: dict, label: str) -> str:
+def _anthropic_content(content: Any) -> Any:
+    if not isinstance(content, list):
+        return content
+    converted = []
+    for item in content:
+        if item.get("type") != "image_url":
+            converted.append(item)
+            continue
+        url = item.get("image_url", {}).get("url", "")
+        match = re.fullmatch(r"data:([^;]+);base64,(.+)", url, flags=re.DOTALL)
+        if not match:
+            raise ValueError("Anthropic 图片必须是 base64 data URL。")
+        converted.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": match.group(1), "data": match.group(2)},
+        })
+    return converted
+
+
+def _anthropic_request(kwargs: dict) -> dict:
+    system_parts = []
+    messages = []
+    for message in kwargs.get("messages", []):
+        if message.get("role") == "system":
+            content = message.get("content", "")
+            system_parts.append(content if isinstance(content, str) else str(content))
+        else:
+            messages.append({"role": message["role"], "content": _anthropic_content(message.get("content", ""))})
+    request = {
+        "model": kwargs["model"],
+        "max_tokens": kwargs.get("max_tokens", 8192),
+        "temperature": kwargs.get("temperature", 0),
+        "messages": messages,
+    }
+    if system_parts:
+        request["system"] = "\n\n".join(system_parts)
+    return request
+
+
+def stream_completion(client: ApiClient, kwargs: dict, label: str) -> str:
     """流式接收模型文本；原始返回写日志，页面只显示耗时与 token usage。"""
     parts: List[str] = []
     reasoning_parts: List[str] = []
     usage = None
     finish_reasons: List[str] = []
     started = time.monotonic()
-    stream_kwargs = dict(kwargs)
-    stream_kwargs["stream"] = True
-    stream_kwargs["stream_options"] = {"include_usage": True}
-
     logger.info(
-        "request started label=%s model=%s images=%s",
+        "request started label=%s protocol=%s model=%s images=%s",
         label,
+        "anthropic" if isinstance(client, Anthropic) else "openai",
         kwargs.get("model"),
         sum(1 for message in kwargs.get("messages", []) for item in (message.get("content", []) if isinstance(message.get("content"), list) else []) if item.get("type") == "image_url"),
     )
-    with client.chat.completions.create(**stream_kwargs) as stream:
-        for chunk in stream:
-            chunk_usage = getattr(chunk, "usage", None)
-            if chunk_usage is not None:
-                usage = chunk_usage
-            choices = getattr(chunk, "choices", [])
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            finish_reason = getattr(choices[0], "finish_reason", None)
-            if finish_reason and finish_reason not in finish_reasons:
-                finish_reasons.append(finish_reason)
-            text = getattr(delta, "content", None) if delta is not None else None
-            reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
-            if isinstance(reasoning, str) and reasoning:
-                reasoning_parts.append(reasoning)
-            if isinstance(text, str) and text:
+    if isinstance(client, Anthropic):
+        with client.messages.stream(**_anthropic_request(kwargs)) as stream:
+            for text in stream.text_stream:
                 parts.append(text)
+            final_message = stream.get_final_message()
+        usage = getattr(final_message, "usage", None)
+        stop_reason = getattr(final_message, "stop_reason", None)
+        if stop_reason:
+            finish_reasons.append(stop_reason)
+    else:
+        stream_kwargs = dict(kwargs)
+        stream_kwargs["stream"] = True
+        stream_kwargs["stream_options"] = {"include_usage": True}
+        with client.chat.completions.create(**stream_kwargs) as stream:
+            for chunk in stream:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = chunk_usage
+                choices = getattr(chunk, "choices", [])
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                finish_reason = getattr(choices[0], "finish_reason", None)
+                if finish_reason and finish_reason not in finish_reasons:
+                    finish_reasons.append(finish_reason)
+                text = getattr(delta, "content", None) if delta is not None else None
+                reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
+                if isinstance(reasoning, str) and reasoning:
+                    reasoning_parts.append(reasoning)
+                if isinstance(text, str) and text:
+                    parts.append(text)
 
     elapsed = time.monotonic() - started
     raw_text = "".join(parts).strip()
-    prompt_tokens = getattr(usage, "prompt_tokens", None)
-    completion_tokens = getattr(usage, "completion_tokens", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None)
     total_tokens = getattr(usage, "total_tokens", None)
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
     logger.info(
         "request completed label=%s model=%s elapsed=%.1fs prompt_tokens=%s completion_tokens=%s total_tokens=%s finish_reason=%s content_chars=%d reasoning_chars=%d",
         label, kwargs.get("model"), elapsed, prompt_tokens, completion_tokens, total_tokens,
@@ -438,18 +507,22 @@ def repair_json(text: str) -> str:
         return text
 
 
-def create_client(api_key: str, base_url: str) -> OpenAI:
-    logger.info("create client base_url=%s", base_url.rstrip("/"))
+def create_client(api_key: str, base_url: str) -> ApiClient:
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/anthropic"):
+        logger.info("create client protocol=anthropic base_url=%s", base_url)
+        return Anthropic(api_key=api_key, base_url=base_url, timeout=180.0, max_retries=2)
+    logger.info("create client protocol=openai base_url=%s", base_url)
     return OpenAI(
         api_key=api_key,
-        base_url=base_url.rstrip("/"),
+        base_url=base_url,
         timeout=180.0,
         max_retries=2,
     )
 
 
 def call_vision_json(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     system_prompt: str,
     user_prompt: str,
@@ -507,7 +580,7 @@ def call_vision_json(
 
 
 def call_vision_text(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     system_prompt: str,
     user_prompt: str,
@@ -533,7 +606,7 @@ def call_vision_text(
 
 
 def locate_markers(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     page: Image.Image,
 ) -> MarkerPageResult:
@@ -572,7 +645,7 @@ def crop_around_marker(
 
 
 def identify_target(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     crop: Image.Image,
     marker: Marker,
@@ -612,7 +685,7 @@ def identify_target(
 
 
 def full_page_analysis(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     page: Image.Image,
 ) -> str:
@@ -698,7 +771,7 @@ def main() -> None:
 
 
 def _run_full_page_mode(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     pages: List[Image.Image],
     source_name: str,
@@ -723,7 +796,7 @@ def _run_full_page_mode(
 
 
 def _run_two_stage_mode(
-    client: OpenAI,
+    client: ApiClient,
     model: str,
     pages: List[Image.Image],
     source_name: str,
