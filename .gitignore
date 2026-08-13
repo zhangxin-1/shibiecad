@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+output/
+backend_config.json
+.streamlit/secrets.toml
