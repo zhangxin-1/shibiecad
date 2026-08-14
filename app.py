@@ -14,7 +14,7 @@ import fitz
 import streamlit as st
 from anthropic import Anthropic
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from pydantic import BaseModel, Field, ValidationError
 
 
@@ -55,6 +55,17 @@ class Marker(BaseModel):
 
 class MarkerPageResult(BaseModel):
     markers: List[Marker]
+
+
+class RecognizedText(BaseModel):
+    text: str
+    bbox: Box
+    text_type: Literal["尺寸", "公差", "技术要求", "标题栏", "普通文字", "其他"]
+    confidence: float = Field(ge=0, le=1)
+
+
+class PageTextResult(BaseModel):
+    texts: List[RecognizedText]
 
 
 class DimensionItem(BaseModel):
@@ -175,6 +186,17 @@ LOCATE_PROMPT = """你是机械 CAD 工程图视觉定位器。输入图是完�
 6. 仔细区分圈内编号，确保不混淆相近数字（如6和9、1和7）；不要把圈内数字当作尺寸。
 7. 按编号逐个检查，不能因为找到部分编号就停止；同一编号重复出现时保留定位更可靠者。
 """
+
+
+PAGE_TEXT_PROMPT = """你是机械 CAD 工程图 OCR 定位器。识别输入整页图纸中所有能够可靠辨认的字符和完整文字组，并返回它们的位置。
+
+要求：
+1. 尽量识别所有尺寸、公差、技术要求、标题栏和普通文字，包括 φ、R、M、±、°、×、小数、上下偏差、形位公差符号和基准字母。
+2. 按具有完整工程含义的文字组输出，例如 M60×2-6H、1.5×45°、φ94 +0.035/0，不要无必要地拆成单个字符。
+3. bbox 必须紧贴该文字组，坐标为相对整页宽高的 0~1 数值。
+4. 橙红色圆圈内的编号由另一任务单独返回，本任务不要把它们加入 texts。
+5. 看不清的内容不要猜测；只返回能够可靠辨认的字符。
+6. 同一位置和内容不要重复返回。"""
 
 
 TARGET_PROMPT = """你是机械工程图尺寸标识关联分析专家。输入图是围绕编号 {number} 裁剪出的高清局部图。编号标识是橙红色或红色圆圈，圈内是数字，圆圈边缘带小三角形尖角。本次只能分析编号 {number}，不要同时推理其他编号。
@@ -350,7 +372,7 @@ def image_base64(image: Image.Image, image_format: str = "PNG") -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def resize_for_api(image: Image.Image, max_long_side: int = 2048) -> Image.Image:
+def resize_for_api(image: Image.Image, max_long_side: int = 4096) -> Image.Image:
     w, h = image.size
     if max(w, h) <= max_long_side:
         return image
@@ -361,7 +383,9 @@ def resize_for_api(image: Image.Image, max_long_side: int = 2048) -> Image.Image
 
 
 def image_block(image: Image.Image) -> dict:
+    original_size = image.size
     image = resize_for_api(image)
+    logger.info("prepare API image original_size=%sx%s sent_size=%sx%s", *original_size, *image.size)
     return {
         "type": "image_url",
         "image_url": {
@@ -371,14 +395,25 @@ def image_block(image: Image.Image) -> dict:
     }
 
 
-def render_pdf(pdf_bytes: bytes, dpi: int) -> List[Image.Image]:
+def enhance_cad_lines(image: Image.Image, gamma: float = 1.8, saturation: float = 1.35) -> Image.Image:
+    """压暗接近白色的彩色 CAD 线条，同时保持纯白背景和原有色相。"""
+    lut = [round(255 * ((value / 255) ** gamma)) for value in range(256)]
+    enhanced = image.point(lut * 3)
+    return ImageEnhance.Color(enhanced).enhance(saturation)
+
+
+def render_pdf(pdf_bytes: bytes, dpi: int, enhance_lines: bool = True) -> List[Image.Image]:
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     matrix = fitz.Matrix(dpi / 72, dpi / 72)
     pages = []
     try:
         for page in document:
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            pages.append(Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB"))
+            pixmap = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=False, annots=True)
+            image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            if enhance_lines:
+                image = enhance_cad_lines(image)
+            logger.info("rendered PDF page dpi=%s size=%sx%s", dpi, *image.size)
+            pages.append(image)
     finally:
         document.close()
     return pages
@@ -681,6 +716,10 @@ def locate_markers(
     return call_vision_json(client, model, "", LOCATE_PROMPT, [page], MarkerPageResult)
 
 
+def recognize_page_texts(client: ApiClient, model: str, page: Image.Image) -> PageTextResult:
+    return call_vision_json(client, model, "", PAGE_TEXT_PROMPT, [page], PageTextResult)
+
+
 def normalized_box_to_pixels(box: Box, size: Tuple[int, int]) -> Tuple[int, int, int, int]:
     width, height = size
     x1 = int(min(box.x1, box.x2) * width)
@@ -802,7 +841,19 @@ def main() -> None:
         model = st.text_input("视觉模型", value=default_model)
         st.divider()
         st.subheader("识别参数")
-        dpi = st.slider("PDF 渲染 DPI", 200, 600, 350, 50)
+        dpi = st.slider(
+            "PDF 渲染 DPI",
+            200,
+            600,
+            450,
+            50,
+            help="PDF 会以所选 DPI 渲染；发送模型时最长边最多保留 4096 像素。",
+        )
+        enhance_lines = st.checkbox(
+            "增强浅色 CAD 线条",
+            value=True,
+            help="压暗浅绿色、浅红色和浅青色线条，保留白色背景，便于模型读取小字。",
+        )
         crop_multiplier = st.slider("标识裁剪范围（标识尺寸倍数）", 6.0, 20.0, 12.0, 1.0)
         min_confidence = st.slider("最低标识置信度", 0.0, 1.0, 0.45, 0.05)
 
@@ -822,7 +873,7 @@ def main() -> None:
 
     if pdf_file:
         with st.spinner("正在渲染 PDF…"):
-            pages = render_pdf(pdf_file.getvalue(), dpi)
+            pages = render_pdf(pdf_file.getvalue(), dpi, enhance_lines)
         source_name = pdf_file.name
     else:
         pages = [Image.open(image_file).convert("RGB")]
@@ -876,6 +927,15 @@ def _run_two_stage_mode(
             located = locate_markers(client, model, page)
             markers = [item for item in located.markers if item.confidence >= min_confidence]
 
+            st.write("第 %d/%d 页：识别全部字符及位置" % (page_index, len(pages)))
+            recognized = recognize_page_texts(client, model, page)
+            logger.info(
+                "page recognition data page=%s markers=%s recognized_texts=%s",
+                page_index,
+                json.dumps([item.model_dump() for item in markers], ensure_ascii=False),
+                json.dumps([item.model_dump() for item in recognized.texts], ensure_ascii=False),
+            )
+
             best_by_number: dict[str, Marker] = {}
             for m in markers:
                 if m.number not in best_by_number or m.confidence > best_by_number[m.number].confidence:
@@ -918,7 +978,13 @@ def _run_two_stage_mode(
                     )
                     right.markdown(info)
 
-            all_results.append({"page": page_index, "items": page_results})
+            all_results.append({
+                "page": page_index,
+                "image_size_pixels": {"width": page.width, "height": page.height},
+                "markers": [item.model_dump() for item in markers],
+                "recognized_texts": [item.model_dump() for item in recognized.texts],
+                "items": page_results,
+            })
             st.image(annotate_page(page, markers), caption="第 %d 页标识定位结果" % page_index)
 
         status.update(label="识别完成", state="complete")
